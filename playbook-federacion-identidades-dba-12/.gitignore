@@ -1,0 +1,5 @@
+.venv
+.entrypoint.mk
+.mk-tools
+.kiro
+Reportes/

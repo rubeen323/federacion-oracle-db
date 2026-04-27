@@ -1,0 +1,116 @@
+---
+# =============================================================================
+# 2-crossref_oracle_ad.yml
+# Cruza usuarios Oracle 12c contra AD via LDAPS.
+# Identico al proyecto 19c: clasifica en listos, pendientes, no-migrar, solo-AD.
+#
+# Uso:
+#   ansible-playbook 2-crossref_oracle_ad.yml --ask-vault-pass
+# =============================================================================
+
+- name: Cruce de usuarios Oracle vs Active Directory
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    reports_dir: "./Reportes"
+    output_base: "{{ reports_dir }}/cruce_oracle_ad_{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+
+  tasks:
+    - name: Validar configuracion AD
+      ansible.builtin.assert:
+        that:
+          - ad_server_uri is defined
+          - ad_search_base is defined
+          - ad_bind_dn is defined
+          - ad_bind_pw is defined
+        fail_msg: "Faltan variables de AD en vars.yml o vault.yml"
+
+    - name: Buscar directorios de descubrimiento existentes
+      ansible.builtin.find:
+        paths: "{{ reports_dir }}"
+        patterns: "oracle_discovery_*"
+        file_type: directory
+      register: discovery_dirs
+
+    - name: Validar que exista al menos un descubrimiento
+      ansible.builtin.assert:
+        that: discovery_dirs.files | length > 0
+        fail_msg: "No se encontraron reportes. Ejecuta primero 1-oracle_users_discovery.yml"
+
+    - name: Determinar descubrimiento mas reciente
+      ansible.builtin.set_fact:
+        latest_discovery: "{{ (discovery_dirs.files | sort(attribute='mtime', reverse=true) | first).path }}"
+
+    - name: Cargar datos Oracle por cada BD
+      ansible.builtin.include_tasks: tasks/load_discovery.yml
+      loop: "{{ oracle_databases }}"
+      loop_control:
+        loop_var: db
+        label: "{{ db.name }}"
+
+    - name: Consultar usuarios en AD
+      community.general.ldap_search:
+        server_uri: "{{ ad_server_uri }}"
+        bind_dn: "{{ ad_bind_dn }}"
+        bind_pw: "{{ ad_bind_pw }}"
+        dn: "{{ ad_search_base }}"
+        scope: "onelevel"
+        filter: "(&(objectClass=user)(objectCategory=person))"
+        attrs:
+          - sAMAccountName
+          - distinguishedName
+          - displayName
+          - userPrincipalName
+          - description
+          - userAccountControl
+        validate_certs: "{{ ad_validate_certs | default(false) }}"
+      register: ad_search_result
+
+    - name: Construir lista de usuarios AD
+      ansible.builtin.set_fact:
+        ad_users: "{{ ad_search_result.results | map(attribute='sAMAccountName') | map('first') | map('upper') | list }}"
+        ad_users_detail: "{{ ad_search_result.results }}"
+
+    - name: Clasificar usuarios
+      ansible.builtin.set_fact:
+        users_ready: "{{ oracle_users_list | intersect(ad_users) | difference(oracle_no_migrate) }}"
+        users_pending_ad: "{{ oracle_users_list | difference(ad_users) | difference(oracle_no_migrate) }}"
+        users_no_migrate: "{{ oracle_users_list | intersect(oracle_no_migrate) }}"
+        users_only_ad: "{{ ad_users | difference(oracle_users_list) }}"
+
+    - name: Crear directorio de salida
+      ansible.builtin.file:
+        path: "{{ output_base }}"
+        state: directory
+        mode: "0755"
+
+    - name: Generar reporte de cruce (texto)
+      ansible.builtin.template:
+        src: templates/crossref_report.j2
+        dest: "{{ output_base }}/cruce_oracle_ad.txt"
+        mode: "0644"
+
+    - name: Guardar cruce en JSON
+      ansible.builtin.copy:
+        content: "{{ crossref_data | to_nice_json }}"
+        dest: "{{ output_base }}/cruce_oracle_ad.json"
+        mode: "0644"
+      vars:
+        crossref_data:
+          fecha: "{{ ansible_date_time.iso8601 }}"
+          descubrimiento_origen: "{{ latest_discovery }}"
+          ad_ou: "{{ ad_search_base }}"
+          listos_para_migrar: "{{ users_ready }}"
+          pendientes_crear_en_ad: "{{ users_pending_ad }}"
+          no_migrar: "{{ users_no_migrate }}"
+          solo_en_ad: "{{ users_only_ad }}"
+
+    - name: Resumen del cruce
+      ansible.builtin.debug:
+        msg:
+          - "=== CRUCE ORACLE 12c vs AD ==="
+          - "Listos para migrar: {{ users_ready | length }} -> {{ users_ready }}"
+          - "Pendientes crear en AD: {{ users_pending_ad | length }} -> {{ users_pending_ad }}"
+          - "No migrar: {{ users_no_migrate | length }} -> {{ users_no_migrate }}"
+          - "Solo en AD: {{ users_only_ad | length }} -> {{ users_only_ad }}"

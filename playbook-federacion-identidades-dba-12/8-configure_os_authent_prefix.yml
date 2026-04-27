@@ -1,0 +1,85 @@
+---
+# =============================================================================
+# 8-configure_os_authent_prefix.yml
+# Configura OS_AUTHENT_PREFIX='' (SPFILE, requiere restart).
+#
+# En Oracle 12c con Kerberos, OS_AUTHENT_PREFIX debe ser vacio para que
+# los nombres de usuario Kerberos coincidan con los usuarios Oracle.
+# El default es 'OPS$' lo que causa que Oracle anteponga 'OPS$' al nombre.
+#
+# Diferencia con 19c: NO se configuran LDAP_DIRECTORY_ACCESS ni
+# LDAP_DIRECTORY_SYSAUTH (esos son exclusivos de CMU).
+#
+# Referencia:
+#   https://docs.oracle.com/database/121/DBSEG/asokerb.htm (Step 6B)
+#   https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/OS_AUTHENT_PREFIX.html
+#
+# Uso:
+#   ansible-playbook 8-configure_os_authent_prefix.yml --ask-vault-pass
+# =============================================================================
+
+- name: Configurar OS_AUTHENT_PREFIX para Kerberos (Oracle 12c)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  tasks:
+    - name: Consultar OS_AUTHENT_PREFIX actual por BD
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": item.host,
+            "port": item.port,
+            "service": item.service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "SELECT name, value FROM v$parameter WHERE name = 'os_authent_prefix'",
+            "binds": {}
+          }) | to_json }}'
+      loop: "{{ oracle_databases }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: params_raw
+
+    - name: Parsear valor actual
+      ansible.builtin.set_fact:
+        current_prefix: "{{ (params_raw.results[0].stdout | from_json | first).VALUE | default('ops$') }}"
+
+    - name: Mostrar valor actual
+      ansible.builtin.debug:
+        msg: "OS_AUTHENT_PREFIX actual: '{{ current_prefix }}'"
+
+    - name: Configurar OS_AUTHENT_PREFIX = '' (SPFILE)
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": item.host,
+            "port": item.port,
+            "service": item.service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "ALTER SYSTEM SET OS_AUTHENT_PREFIX = '' SCOPE=SPFILE",
+            "binds": {}
+          }) | to_json }}'
+      loop: "{{ oracle_databases }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: current_prefix != ''
+
+    - name: Ya configurado
+      ansible.builtin.debug:
+        msg: "OS_AUTHENT_PREFIX ya es vacio, no se modifica."
+      when: current_prefix == ''
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "=== OS_AUTHENT_PREFIX CONFIGURADO ==="
+          - "OS_AUTHENT_PREFIX = '' (SPFILE - requiere restart)"
+          - ""
+          - "ACCION REQUERIDA: Reiniciar la instancia Oracle:"
+          - "  sqlplus / as sysdba"
+          - "  SHUTDOWN IMMEDIATE;"
+          - "  STARTUP;"
+          - "  SHOW PARAMETER os_authent_prefix;  -- Debe mostrar '' (vacio)"
+      when: current_prefix != ''

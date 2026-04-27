@@ -1,0 +1,60 @@
+---
+# =============================================================================
+# 5-check_sqlnet.yml
+# Verifica el contenido actual de sqlnet.ora y reporta si los parametros
+# de Kerberos estan configurados. Solo lectura.
+#
+# Uso:
+#   ansible-playbook 5-check_sqlnet.yml
+# =============================================================================
+
+- name: Verificar configuracion sqlnet.ora en servidores Oracle 12c
+  hosts: oracle_servers
+  become: true
+  become_user: oracle
+  vars:
+    kerberos_params:
+      - SQLNET.AUTHENTICATION_SERVICES
+      - SQLNET.AUTHENTICATION_KERBEROS5_SERVICE
+      - SQLNET.KERBEROS5_KEYTAB
+      - SQLNET.KERBEROS5_CONF
+      - SQLNET.KERBEROS5_CONF_MIT
+      - SQLNET.FALLBACK_AUTHENTICATION
+
+  tasks:
+    - name: Determinar ORACLE_HOME por servidor
+      ansible.builtin.set_fact:
+        oracle_home: "{{ (oracle_databases | selectattr('host', 'equalto', inventory_hostname) | first).oracle_home | default('/u01/app/oracle/product/12.1.0/dbhome_1') }}"
+
+    - name: Verificar si sqlnet.ora existe
+      ansible.builtin.stat:
+        path: "{{ oracle_home }}/network/admin/sqlnet.ora"
+      register: sqlnet_file
+
+    - name: Leer sqlnet.ora
+      ansible.builtin.slurp:
+        src: "{{ oracle_home }}/network/admin/sqlnet.ora"
+      register: sqlnet_content
+      when: sqlnet_file.stat.exists
+
+    - name: Mostrar contenido actual
+      ansible.builtin.debug:
+        msg: "{{ (sqlnet_content.content | b64decode).split('\n') }}"
+      when: sqlnet_file.stat.exists
+
+    - name: Verificar parametros de Kerberos
+      ansible.builtin.set_fact:
+        param_status: >-
+          {{ param_status | default([]) + [{
+            'parametro': item,
+            'configurado': (sqlnet_content.content | b64decode | upper) is search(item | upper)
+          }] }}
+      loop: "{{ kerberos_params }}"
+      when: sqlnet_file.stat.exists
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "=== ESTADO KERBEROS EN {{ inventory_hostname }} ==="
+          - "{% for p in param_status | default([]) %}{{ p.parametro }}: {{ 'SI' if p.configurado else 'NO' }}\n{% endfor %}"
+      when: sqlnet_file.stat.exists

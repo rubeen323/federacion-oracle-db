@@ -1,0 +1,79 @@
+CRUCE DE USUARIOS ORACLE vs ACTIVE DIRECTORY
+Fecha: {{ ansible_date_time.iso8601 }}
+Descubrimiento origen: {{ latest_discovery }}
+OU consultada: {{ ad_search_base }}
+===============================================================================
+
+RESUMEN
+===============================================================================
+Usuarios Oracle (no oracle_maintained): {{ oracle_users_list | length }}
+Usuarios en AD (OU):                    {{ ad_users | length }}
+Listos para migrar (en ambos):          {{ users_ready | length }}
+Pendientes crear en AD:                 {{ users_pending_ad | length }}
+No migrar (servicio/schemas):           {{ users_no_migrate | length }}
+Solo en AD (sin usuario Oracle):        {{ users_only_ad | length }}
+
+===============================================================================
+LISTOS PARA MIGRAR (existen en Oracle Y en AD)
+===============================================================================
+{% for user in users_ready %}
+  - {{ user }}
+{% endfor %}
+{% if users_ready | length == 0 %}
+  (ninguno)
+{% endif %}
+
+===============================================================================
+PENDIENTES CREAR EN AD (existen en Oracle, NO en AD, candidatos a migrar)
+===============================================================================
+{% for user in users_pending_ad %}
+  - {{ user }}
+{% endfor %}
+{% if users_pending_ad | length == 0 %}
+  (ninguno)
+{% endif %}
+
+===============================================================================
+NO MIGRAR (cuentas de servicio / schemas de aplicacion)
+===============================================================================
+{% for user in users_no_migrate %}
+  - {{ user }}
+{% endfor %}
+{% if users_no_migrate | length == 0 %}
+  (ninguno)
+{% endif %}
+
+===============================================================================
+SOLO EN AD (sin usuario correspondiente en Oracle)
+===============================================================================
+{% for user in users_only_ad %}
+  - {{ user }}
+{% endfor %}
+{% if users_only_ad | length == 0 %}
+  (ninguno)
+{% endif %}
+
+===============================================================================
+DETALLE USUARIOS AD EN LA OU
+===============================================================================
+{% for entry in ad_users_detail %}
+  DN: {{ entry.dn }}
+  sAMAccountName: {{ entry.sAMAccountName | first }}
+  displayName: {{ entry.get('displayName', ['N/A']) | first }}
+  UPN: {{ entry.get('userPrincipalName', ['N/A']) | first }}
+  Descripcion: {{ entry.get('description', ['N/A']) | first }}
+-------------------------------------------------------------------------------
+{% endfor %}
+
+===============================================================================
+DETALLE USUARIOS ORACLE
+===============================================================================
+{% for user in oracle_users_detail %}
+  Usuario: {{ user.USERNAME }}
+  Estado: {{ user.ACCOUNT_STATUS }}
+  Tablespace: {{ user.DEFAULT_TABLESPACE }}
+  Profile: {{ user.PROFILE }}
+  Clasificacion: {% if user.USERNAME in users_ready %}LISTO PARA MIGRAR{% elif user.USERNAME in users_pending_ad %}PENDIENTE CREAR EN AD{% elif user.USERNAME in users_no_migrate %}NO MIGRAR{% else %}SIN CLASIFICAR{% endif %}
+
+-------------------------------------------------------------------------------
+{% endfor %}

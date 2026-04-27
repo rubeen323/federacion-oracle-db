@@ -1,0 +1,205 @@
+---
+# =============================================================================
+# 11-validate_migration.yml
+# Valida post-migracion para Oracle 12c (Kerberos puro):
+#   1. AUTHENTICATION_TYPE = EXTERNAL
+#   2. EXTERNAL_NAME coincide con el principal Kerberos
+#   3. Privilegios de sistema intactos
+#   4. Roles intactos
+#   5. Privilegios de objetos intactos
+#
+# Uso:
+#   ansible-playbook 11-validate_migration.yml --ask-vault-pass
+# =============================================================================
+
+- name: Validar migracion Oracle 12c a Kerberos
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    reports_dir: "./Reportes"
+    output_base: "{{ reports_dir }}/validation_{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+
+  tasks:
+    - name: Buscar descubrimiento
+      ansible.builtin.find:
+        paths: "{{ reports_dir }}"
+        patterns: "oracle_discovery_*"
+        file_type: directory
+      register: discovery_dirs
+
+    - name: Determinar descubrimiento mas reciente
+      ansible.builtin.set_fact:
+        latest_discovery: "{{ (discovery_dirs.files | sort(attribute='mtime', reverse=true) | first).path }}"
+
+    - name: Cargar usuarios
+      ansible.builtin.include_tasks: tasks/load_discovery.yml
+      loop: "{{ oracle_databases }}"
+      loop_control:
+        loop_var: db
+        label: "{{ db.name }}"
+
+    - name: Determinar usuarios esperados como migrados
+      ansible.builtin.set_fact:
+        expected_migrated: "{{ oracle_users_list | difference(oracle_no_migrate) }}"
+
+    - name: Cargar baseline de privilegios
+      ansible.builtin.slurp:
+        src: "{{ latest_discovery }}/{{ oracle_databases[0].name }}/{{ item }}"
+      loop:
+        - privilegios_sistema.json
+        - roles.json
+        - privilegios_objetos.json
+      register: _baseline_raw
+
+    - name: Parsear baseline
+      ansible.builtin.set_fact:
+        orig_sysprivs: "{{ _baseline_raw.results[0].content | b64decode | from_json }}"
+        orig_roles: "{{ _baseline_raw.results[1].content | b64decode | from_json }}"
+        orig_objprivs: "{{ _baseline_raw.results[2].content | b64decode | from_json }}"
+
+    # --- Consultar estado actual ---
+    - name: Consultar autenticacion actual
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "SELECT username, authentication_type, external_name FROM dba_users WHERE username IN (" + (expected_migrated | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") ORDER BY username",
+            "binds": {}
+          }) | to_json }}'
+      register: _current_users_raw
+
+    - name: Consultar privilegios actuales
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "SELECT grantee, privilege, admin_option FROM dba_sys_privs WHERE grantee IN (" + (expected_migrated | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") ORDER BY grantee, privilege",
+            "binds": {}
+          }) | to_json }}'
+      register: _current_sysprivs_raw
+
+    - name: Consultar roles actuales
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "SELECT grantee, granted_role, admin_option, default_role FROM dba_role_privs WHERE grantee IN (" + (expected_migrated | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") ORDER BY grantee, granted_role",
+            "binds": {}
+          }) | to_json }}'
+      register: _current_roles_raw
+
+    - name: Consultar privilegios de objetos actuales
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "SELECT grantee, owner, table_name, privilege, grantable FROM dba_tab_privs WHERE grantee IN (" + (expected_migrated | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") ORDER BY grantee, owner, table_name",
+            "binds": {}
+          }) | to_json }}'
+      register: _current_objprivs_raw
+
+    - name: Parsear estado actual
+      ansible.builtin.set_fact:
+        current_users: "{{ _current_users_raw.stdout | from_json }}"
+        current_sysprivs: "{{ _current_sysprivs_raw.stdout | from_json }}"
+        current_roles: "{{ _current_roles_raw.stdout | from_json }}"
+        current_objprivs: "{{ _current_objprivs_raw.stdout | from_json }}"
+
+    # --- Validar autenticacion EXTERNAL ---
+    - name: Validar autenticacion
+      ansible.builtin.set_fact:
+        auth_results: >-
+          {{ auth_results | default([]) + [{
+            'username': item,
+            'auth_type': ((current_users | selectattr('USERNAME', 'equalto', item) | map(attribute='AUTHENTICATION_TYPE') | first) | default('DESCONOCIDO')),
+            'external_name': ((current_users | selectattr('USERNAME', 'equalto', item) | map(attribute='EXTERNAL_NAME') | first) | default('N/A')),
+            'auth_ok': ((current_users | selectattr('USERNAME', 'equalto', item) | map(attribute='AUTHENTICATION_TYPE') | first) | default('')) == 'EXTERNAL'
+          }] }}
+      loop: "{{ expected_migrated }}"
+
+    # --- Comparar privilegios ---
+    - name: Comparar privilegios de sistema
+      ansible.builtin.set_fact:
+        orig_syspriv_set: "{{ (orig_sysprivs | selectattr('GRANTEE', 'in', expected_migrated) | list) | map(attribute='GRANTEE') | zip((orig_sysprivs | selectattr('GRANTEE', 'in', expected_migrated) | list) | map(attribute='PRIVILEGE')) | map('join', '|') | sort | list }}"
+        current_syspriv_set: "{{ (current_sysprivs | list) | map(attribute='GRANTEE') | zip((current_sysprivs | list) | map(attribute='PRIVILEGE')) | map('join', '|') | sort | list }}"
+
+    - name: Detectar privilegios perdidos
+      ansible.builtin.set_fact:
+        sysprivs_lost: "{{ orig_syspriv_set | difference(current_syspriv_set) }}"
+        roles_lost: "{{ ((orig_roles | selectattr('GRANTEE', 'in', expected_migrated) | list) | map(attribute='GRANTEE') | zip((orig_roles | selectattr('GRANTEE', 'in', expected_migrated) | list) | map(attribute='GRANTED_ROLE')) | map('join', '|') | sort | list) | difference((current_roles | list) | map(attribute='GRANTEE') | zip((current_roles | list) | map(attribute='GRANTED_ROLE')) | map('join', '|') | sort | list) }}"
+        objprivs_lost: "{{ ((orig_objprivs | selectattr('GRANTEE', 'in', expected_migrated) | list) | map(attribute='GRANTEE') | zip((orig_objprivs | selectattr('GRANTEE', 'in', expected_migrated) | list) | map(attribute='OWNER'), (orig_objprivs | selectattr('GRANTEE', 'in', expected_migrated) | list) | map(attribute='TABLE_NAME'), (orig_objprivs | selectattr('GRANTEE', 'in', expected_migrated) | list) | map(attribute='PRIVILEGE')) | map('join', '|') | sort | list) | difference((current_objprivs | list) | map(attribute='GRANTEE') | zip((current_objprivs | list) | map(attribute='OWNER'), (current_objprivs | list) | map(attribute='TABLE_NAME'), (current_objprivs | list) | map(attribute='PRIVILEGE')) | map('join', '|') | sort | list) }}"
+
+    - name: Resultado global
+      ansible.builtin.set_fact:
+        validation_passed: "{{ (auth_results | map(attribute='auth_ok') | reject('equalto', true) | list | length == 0) and (sysprivs_lost | length == 0) and (roles_lost | length == 0) and (objprivs_lost | length == 0) }}"
+
+    # --- Reporte ---
+    - name: Crear directorio de salida
+      ansible.builtin.file:
+        path: "{{ output_base }}"
+        state: directory
+        mode: "0755"
+
+    - name: Generar reporte
+      ansible.builtin.copy:
+        dest: "{{ output_base }}/validation_report.txt"
+        mode: "0644"
+        content: |
+          VALIDACION POST-MIGRACION ORACLE 12c KERBEROS
+          Fecha: {{ ansible_date_time.iso8601 }}
+          Resultado: {{ 'PASS' if validation_passed else '*** FAIL ***' }}
+          ============================================================
+
+          AUTENTICACION
+          {% for r in auth_results %}
+          {{ r.username }}: {{ r.auth_type }} {{ '[OK]' if r.auth_ok else '[FAIL]' }} | external_name={{ r.external_name }}
+          {% endfor %}
+
+          PRIVILEGIOS SISTEMA PERDIDOS: {{ sysprivs_lost | length }}
+          {% for p in sysprivs_lost %}  [PERDIDO] {{ p }}
+          {% endfor %}
+
+          ROLES PERDIDOS: {{ roles_lost | length }}
+          {% for r in roles_lost %}  [PERDIDO] {{ r }}
+          {% endfor %}
+
+          PRIVILEGIOS OBJETOS PERDIDOS: {{ objprivs_lost | length }}
+          {% for p in objprivs_lost %}  [PERDIDO] {{ p }}
+          {% endfor %}
+
+    - name: Guardar reporte JSON
+      ansible.builtin.copy:
+        content: "{{ {'resultado': ('PASS' if validation_passed else 'FAIL'), 'autenticacion': auth_results, 'sysprivs_lost': sysprivs_lost, 'roles_lost': roles_lost, 'objprivs_lost': objprivs_lost} | to_nice_json }}"
+        dest: "{{ output_base }}/validation_report.json"
+        mode: "0644"
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "=== VALIDACION {{ 'EXITOSA' if validation_passed else 'CON FALLOS' }} ==="
+          - "Auth EXTERNAL: {{ auth_results | selectattr('auth_ok') | list | length }}/{{ auth_results | length }}"
+          - "Privilegios perdidos: {{ sysprivs_lost | length }}"
+          - "Roles perdidos: {{ roles_lost | length }}"
+          - "Obj privs perdidos: {{ objprivs_lost | length }}"
+
+    - name: Fallar si no paso
+      ansible.builtin.assert:
+        that: validation_passed
+        fail_msg: "Validacion fallo. Ver {{ output_base }}/validation_report.txt"

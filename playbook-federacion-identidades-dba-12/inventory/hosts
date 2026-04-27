@@ -1,0 +1,10 @@
+[local]
+localhost ansible_connection=local ansible_python_interpreter=.venv/bin/python3
+
+[oracle_servers]
+# Servidores RHEL 8.10 con bases de datos Oracle 12.1/12.2
+# 192.168.0.20  ansible_user=oracle  # DB12A - Oracle 12.1
+# 192.168.0.21  ansible_user=oracle  # DB12B - Oracle 12.2
+
+[domain_controllers]
+dc01.laboratorio.local  ansible_connection=winrm ansible_winrm_transport=ntlm ansible_winrm_server_cert_validation=ignore ansible_port=5985

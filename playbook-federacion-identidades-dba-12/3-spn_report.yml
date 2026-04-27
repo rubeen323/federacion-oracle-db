@@ -1,0 +1,96 @@
+---
+- name: Reporte de SPN para Kerberos - Servidores Oracle
+  hosts: oracle_servers
+  gather_facts: true
+  vars:
+    kerberos_service: "oracle"
+    kerberos_realm: "LABORATORIO.LOCAL"
+
+  tasks:
+    - name: Construir SPN del servidor
+      ansible.builtin.set_fact:
+        server_spn: "{{ kerberos_service }}/{{ ansible_fqdn }}@{{ kerberos_realm }}"
+        server_info:
+          host: "{{ inventory_hostname }}"
+          fqdn: "{{ ansible_fqdn }}"
+          hostname: "{{ ansible_hostname }}"
+          ip: "{{ ansible_default_ipv4.address | default(inventory_hostname) }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          spn: "{{ kerberos_service }}/{{ ansible_fqdn }}@{{ kerberos_realm }}"
+
+    - name: Mostrar SPN detectado
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} -> {{ server_spn }}"
+
+- name: Generar reporte consolidado de SPN
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    kerberos_service: "oracle"
+    kerberos_realm: "LABORATORIO.LOCAL"
+    reports_dir: "./Reportes"
+    output_base: "{{ reports_dir }}/spn_report_{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+
+  tasks:
+    - name: Recopilar datos de los servidores Oracle
+      ansible.builtin.set_fact:
+        all_servers: "{{ groups['oracle_servers'] | map('extract', hostvars, 'server_info') | list }}"
+        spn_list: "{{ groups['oracle_servers'] | map('extract', hostvars, 'server_spn') | list }}"
+
+    - name: Crear directorio de salida
+      ansible.builtin.file:
+        path: "{{ output_base }}"
+        state: directory
+        mode: "0755"
+
+    - name: Generar reporte de SPN (texto)
+      ansible.builtin.copy:
+        dest: "{{ output_base }}/spn_report.txt"
+        mode: "0644"
+        content: |
+          ============================================================
+          REPORTE DE SERVICE PRINCIPAL NAMES (SPN) - KERBEROS
+          Fecha: {{ ansible_date_time.iso8601 }}
+          Realm: {{ kerberos_realm }}
+          Servicio: {{ kerberos_service }}
+          ============================================================
+
+          {% for srv in all_servers %}
+          Servidor  : {{ srv.host }}
+          FQDN      : {{ srv.fqdn }}
+          Hostname  : {{ srv.hostname }}
+          IP        : {{ srv.ip }}
+          OS        : {{ srv.os }}
+          SPN       : {{ srv.spn }}
+          ------------------------------------------------------------
+          {% endfor %}
+
+          Total servidores: {{ all_servers | length }}
+
+          === LISTADO DE SPN PARA CONFIGURAR EN EL DC ===
+          {% for spn in spn_list %}
+          {{ spn }}
+          {% endfor %}
+
+    - name: Guardar reporte JSON
+      ansible.builtin.copy:
+        dest: "{{ output_base }}/spn_report.json"
+        mode: "0644"
+        content: "{{ spn_data | to_nice_json }}"
+      vars:
+        spn_data:
+          fecha: "{{ ansible_date_time.iso8601 }}"
+          realm: "{{ kerberos_realm }}"
+          servicio: "{{ kerberos_service }}"
+          servidores: "{{ all_servers }}"
+          spn_list: "{{ spn_list }}"
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "=== REPORTE SPN GENERADO ==="
+          - "Directorio: {{ output_base }}"
+          - "Servidores: {{ groups['oracle_servers'] | length }}"
+          - "SPNs detectados:"
+          - "{{ spn_list }}"

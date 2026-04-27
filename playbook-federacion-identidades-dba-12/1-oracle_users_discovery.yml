@@ -1,0 +1,32 @@
+---
+# =============================================================================
+# 1-oracle_users_discovery.yml
+# Descubre usuarios, privilegios de sistema, privilegios de objetos y roles
+# en bases de datos Oracle 12.1/12.2.
+#
+# Diferencia con 19c: en 12.1 no existe la columna oracle_maintained en
+# dba_users. Se usa oracle_excluded_users (vars.yml) para filtrar.
+#
+# Uso:
+#   ansible-playbook 1-oracle_users_discovery.yml --ask-vault-pass
+# =============================================================================
+
+- name: Descubrimiento de usuarios y permisos en Oracle 12c
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    output_base: "./Reportes/oracle_discovery_{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+
+  tasks:
+    - name: Validar que existan bases de datos configuradas
+      ansible.builtin.assert:
+        that: oracle_databases | length > 0
+        fail_msg: "No hay bases de datos configuradas en vars.yml"
+
+    - name: Descubrir usuarios y permisos por base de datos
+      ansible.builtin.include_tasks: tasks/discover_oracle.yml
+      loop: "{{ oracle_databases }}"
+      loop_control:
+        loop_var: db
+        label: "{{ db.name }}"

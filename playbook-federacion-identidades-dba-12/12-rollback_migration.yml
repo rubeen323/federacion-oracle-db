@@ -1,0 +1,265 @@
+---
+# =============================================================================
+# 12-rollback_migration.yml
+# Revierte la migracion Kerberos en Oracle 12c en 2 capas:
+#
+#   Capa 1 - Usuarios: ALTER USER IDENTIFIED BY VALUES '<hash>'
+#   Capa 2 - Config RHEL: restaura sqlnet.ora y krb5.conf desde backups,
+#            revierte OS_AUTHENT_PREFIX a 'ops$' (SPFILE, requiere restart)
+#
+# Diferencia con 19c: NO hay capa de parametros CMU (LDAP_DIRECTORY_ACCESS,
+# LDAP_DIRECTORY_SYSAUTH no existen en 12c Kerberos puro).
+#
+# Uso:
+#   ansible-playbook 12-rollback_migration.yml --ask-vault-pass
+#   ansible-playbook 12-rollback_migration.yml --ask-vault-pass -e "rollback_scope=users_only"
+#   ansible-playbook 12-rollback_migration.yml --ask-vault-pass -e '{"rollback_scope":"users_only","rollback_users":["USR_JPEREZ"]}'
+# =============================================================================
+
+# =========================================================
+# Play 1: Rollback de usuarios (Capa 1)
+# =========================================================
+- name: "Capa 1 - Restaurar autenticacion local"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    reports_dir: "./Reportes"
+    output_base: "{{ reports_dir }}/rollback_{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+    rollback_scope: "full"
+
+  tasks:
+    - name: Crear directorio de salida
+      ansible.builtin.file:
+        path: "{{ output_base }}"
+        state: directory
+        mode: "0755"
+
+    - name: Guardar scope
+      ansible.builtin.set_fact:
+        _output_base: "{{ output_base }}"
+        _rollback_scope: "{{ rollback_scope }}"
+
+    - name: Buscar backups de hashes
+      ansible.builtin.find:
+        paths: "{{ reports_dir }}"
+        patterns: "password_backup_*"
+        file_type: directory
+      register: backup_dirs
+
+    - name: Validar backup
+      ansible.builtin.assert:
+        that: backup_dirs.files | length > 0
+        fail_msg: "No se encontraron backups de password hashes"
+
+    - name: Cargar hashes
+      ansible.builtin.slurp:
+        src: "{{ (backup_dirs.files | sort(attribute='mtime', reverse=true) | first).path }}/hashes_migrar.json"
+      register: _hashes_raw
+
+    - name: Parsear hashes
+      ansible.builtin.set_fact:
+        all_hashes: "{{ _hashes_raw.content | b64decode | from_json }}"
+
+    - name: Consultar usuarios EXTERNAL
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "SELECT username FROM dba_users WHERE authentication_type = 'EXTERNAL' ORDER BY username",
+            "binds": {}
+          }) | to_json }}'
+      register: _ext_users_raw
+
+    - name: Determinar usuarios a revertir
+      ansible.builtin.set_fact:
+        external_users: "{{ (_ext_users_raw.stdout | from_json) | map(attribute='USERNAME') | list }}"
+        users_to_rollback: "{{ rollback_users | default((_ext_users_raw.stdout | from_json) | map(attribute='USERNAME') | list) | intersect((_ext_users_raw.stdout | from_json) | map(attribute='USERNAME') | list) }}"
+
+    - name: Salir si no hay usuarios
+      when: users_to_rollback | length == 0
+      block:
+        - name: Informar
+          ansible.builtin.debug:
+            msg: "No hay usuarios EXTERNAL para revertir."
+        - name: Continuar
+          ansible.builtin.meta: end_host
+          when: _rollback_scope != 'full'
+
+    - name: Construir mapa de hashes
+      ansible.builtin.set_fact:
+        restore_map: >-
+          {{ restore_map | default({}) | combine({
+            item.USERNAME: item.SPARE4_HASH if (item.SPARE4_HASH is not none and item.SPARE4_HASH != '') else item.PASSWORD_HASH
+          }) }}
+      loop: "{{ all_hashes | selectattr('USERNAME', 'in', users_to_rollback) | list }}"
+      loop_control:
+        label: "{{ item.USERNAME }}"
+      when: users_to_rollback | length > 0
+
+    - name: Restaurar password hash
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "ALTER USER " + item + " IDENTIFIED BY VALUES '" + restore_map[item] + "'",
+            "binds": {}
+          }) | to_json }}'
+      loop: "{{ users_to_rollback }}"
+      no_log: true
+      when: users_to_rollback | length > 0
+
+    - name: Verificar rollback
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "SELECT username, authentication_type FROM dba_users WHERE username IN (" + (users_to_rollback | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ")",
+            "binds": {}
+          }) | to_json }}'
+      register: _post_raw
+      when: users_to_rollback | length > 0
+
+    - name: Validar PASSWORD
+      ansible.builtin.assert:
+        that:
+          - ((_post_raw.stdout | from_json) | selectattr('USERNAME', 'equalto', item) | map(attribute='AUTHENTICATION_TYPE') | first) == 'PASSWORD'
+        fail_msg: "FALLO: {{ item }} no volvio a PASSWORD"
+        success_msg: "OK: {{ item }} -> PASSWORD"
+      loop: "{{ users_to_rollback }}"
+      when: users_to_rollback | length > 0
+
+    - name: Guardar reporte capa 1
+      ansible.builtin.copy:
+        content: "CAPA 1 - Usuarios revertidos: {{ users_to_rollback | default([]) | join(', ') }}\n"
+        dest: "{{ _output_base }}/capa1_usuarios.txt"
+        mode: "0644"
+
+# =========================================================
+# Play 2: Rollback de config RHEL (Capa 2)
+# =========================================================
+- name: "Capa 2 - Restaurar sqlnet.ora, krb5.conf y OS_AUTHENT_PREFIX"
+  hosts: oracle_servers
+  become: true
+  become_user: oracle
+  vars:
+    krb5_conf_path: "/etc/krb5.conf"
+    rollback_scope: "full"
+
+  tasks:
+    - name: Saltar si users_only
+      ansible.builtin.meta: end_play
+      when: rollback_scope == 'users_only'
+
+    - name: Determinar ORACLE_HOME
+      ansible.builtin.set_fact:
+        oracle_home: "{{ (oracle_databases | selectattr('host', 'equalto', inventory_hostname) | first).oracle_home }}"
+
+    - name: Buscar backups de sqlnet.ora
+      ansible.builtin.find:
+        paths: "{{ oracle_home }}/network/admin"
+        patterns: "sqlnet.ora.bak.*"
+        file_type: file
+      register: sqlnet_backups
+
+    - name: Restaurar sqlnet.ora
+      ansible.builtin.copy:
+        src: "{{ (sqlnet_backups.files | sort(attribute='mtime') | first).path }}"
+        dest: "{{ oracle_home }}/network/admin/sqlnet.ora"
+        remote_src: true
+        mode: "0644"
+      when: sqlnet_backups.files | length > 0
+
+    - name: Buscar backups de krb5.conf
+      ansible.builtin.find:
+        paths: "/etc"
+        patterns: "krb5.conf.bak.*"
+        file_type: file
+      register: krb5_backups
+      become_user: root
+
+    - name: Restaurar krb5.conf
+      ansible.builtin.copy:
+        src: "{{ (krb5_backups.files | sort(attribute='mtime') | first).path }}"
+        dest: "{{ krb5_conf_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      become_user: root
+      when: krb5_backups.files | length > 0
+
+- name: "Capa 2 - Revertir OS_AUTHENT_PREFIX"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    rollback_scope: "full"
+
+  tasks:
+    - name: Saltar si users_only
+      ansible.builtin.meta: end_play
+      when: rollback_scope == 'users_only'
+
+    - name: Revertir OS_AUTHENT_PREFIX a ops$ (SPFILE)
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "ALTER SYSTEM SET OS_AUTHENT_PREFIX = 'ops$' SCOPE=SPFILE",
+            "binds": {}
+          }) | to_json }}'
+
+# =========================================================
+# Play 3: Reporte final
+# =========================================================
+- name: "Reporte final de rollback"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    rollback_scope: "full"
+
+  tasks:
+    - name: Generar reporte
+      ansible.builtin.copy:
+        dest: "{{ _output_base }}/rollback_report.txt"
+        mode: "0644"
+        content: |
+          ROLLBACK MIGRACION ORACLE 12c KERBEROS
+          Fecha: {{ ansible_date_time.iso8601 }}
+          Scope: {{ _rollback_scope }}
+          ============================================================
+
+          CAPA 1 - USUARIOS: Revertidos a PASSWORD
+          {% if _rollback_scope == 'full' %}
+          CAPA 2 - CONFIG: sqlnet.ora y krb5.conf restaurados
+                   OS_AUTHENT_PREFIX = ops$ (SPFILE - requiere restart)
+
+          ACCION REQUERIDA: Reiniciar la instancia Oracle
+          {% else %}
+          CAPA 2 - (no revertido - scope: users_only)
+          {% endif %}
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "=== ROLLBACK {{ 'COMPLETO' if _rollback_scope == 'full' else 'PARCIAL' }} ==="
+          - "Reporte: {{ _output_base }}"
+          - "{% if _rollback_scope == 'full' %}ACCION REQUERIDA: Restart de la instancia Oracle{% endif %}"

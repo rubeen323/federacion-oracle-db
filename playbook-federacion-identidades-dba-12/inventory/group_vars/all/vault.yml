@@ -1,0 +1,14 @@
+---
+# Cifrar con: ansible-vault encrypt inventory/group_vars/all/vault.yml
+oracle_user: "<user>"
+oracle_password: "<password>"
+
+# Credenciales para bind LDAPS contra Active Directory
+ad_bind_pw: "<ad_bind_password>"
+
+# Credenciales de administrador del Domain Controller (para WinRM)
+dc_admin_user: "<domain>\\<admin_user>"
+dc_admin_password: "<admin_password>"
+
+# Password de la cuenta de servicio Kerberos (para ktpass)
+kerberos_svc_password: "<kerberos_service_account_password>"

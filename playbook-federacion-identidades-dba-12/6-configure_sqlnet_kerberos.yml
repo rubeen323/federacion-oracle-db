@@ -1,0 +1,91 @@
+---
+# =============================================================================
+# 6-configure_sqlnet_kerberos.yml
+# Configura parametros Kerberos en sqlnet.ora para Oracle 12.1/12.2.
+#
+# Diferencia con 19c: NO se configura nada de CMU (dsi.ora, wallet, LDAP).
+# Solo Kerberos puro.
+#
+# Referencia:
+#   https://docs.oracle.com/database/121/DBSEG/asokerb.htm
+#   https://docs.oracle.com/cd/E11882_01/network.112/e40393/asokerb.htm
+#
+# Uso:
+#   ansible-playbook 6-configure_sqlnet_kerberos.yml
+# =============================================================================
+
+- name: Configurar parametros Kerberos en sqlnet.ora (Oracle 12c)
+  hosts: oracle_servers
+  become: true
+  become_user: oracle
+  vars:
+    keytab_path: "/etc/oracle/keytab/v5srvtab"
+    krb5_conf_path: "/etc/krb5.conf"
+    kerberos_params:
+      SQLNET.AUTHENTICATION_SERVICES: "(BEQ,KERBEROS5)"
+      SQLNET.AUTHENTICATION_KERBEROS5_SERVICE: "{{ kerberos_service }}"
+      SQLNET.KERBEROS5_KEYTAB: "{{ keytab_path }}"
+      SQLNET.KERBEROS5_CONF: "{{ krb5_conf_path }}"
+      SQLNET.KERBEROS5_CONF_MIT: "TRUE"
+      SQLNET.FALLBACK_AUTHENTICATION: "TRUE"
+
+  tasks:
+    - name: Determinar ORACLE_HOME
+      ansible.builtin.set_fact:
+        oracle_home: "{{ (oracle_databases | selectattr('host', 'equalto', inventory_hostname) | first).oracle_home }}"
+
+    - name: Definir ruta sqlnet.ora
+      ansible.builtin.set_fact:
+        sqlnet_path: "{{ oracle_home }}/network/admin/sqlnet.ora"
+
+    - name: Verificar que sqlnet.ora existe
+      ansible.builtin.stat:
+        path: "{{ sqlnet_path }}"
+      register: sqlnet_file
+
+    - name: Fallar si sqlnet.ora no existe
+      ansible.builtin.assert:
+        that: sqlnet_file.stat.exists
+        fail_msg: "sqlnet.ora no existe en {{ sqlnet_path }}"
+
+    - name: Respaldar sqlnet.ora
+      ansible.builtin.copy:
+        src: "{{ sqlnet_path }}"
+        dest: "{{ sqlnet_path }}.bak.{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        mode: "0644"
+
+    - name: Configurar parametros Kerberos
+      ansible.builtin.lineinfile:
+        path: "{{ sqlnet_path }}"
+        regexp: '^\s*{{ item.key }}\s*='
+        line: "{{ item.key }}={{ item.value }}"
+        state: present
+        mode: "0644"
+      loop: "{{ kerberos_params | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Leer sqlnet.ora final
+      ansible.builtin.slurp:
+        src: "{{ sqlnet_path }}"
+      register: sqlnet_final
+
+    - name: Verificar parametros
+      ansible.builtin.assert:
+        that:
+          - "(sqlnet_final.content | b64decode) is search(item.key + '=' + item.value)"
+        fail_msg: "{{ item.key }} no se configuro"
+        success_msg: "OK: {{ item.key }}={{ item.value }}"
+      loop: "{{ kerberos_params | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "=== SQLNET.ORA KERBEROS CONFIGURADO ==="
+          - "Servidor: {{ inventory_hostname }}"
+          - "Backup: {{ sqlnet_path }}.bak.{{ ansible_date_time.iso8601_basic_short }}"
+          - "SPN esperado: {{ kerberos_service }}/{{ ansible_fqdn }}@{{ kerberos_realm }}"
+          - "Fallback auth: TRUE (coexistencia habilitada)"

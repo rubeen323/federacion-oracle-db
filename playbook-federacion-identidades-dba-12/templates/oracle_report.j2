@@ -1,0 +1,32 @@
+REPORTE DE USUARIOS Y PERMISOS - ORACLE DATABASE 12c
+Fecha: {{ ansible_date_time.iso8601 }}
+DSN: {{ oracle_dsn }}
+===============================================================================
+
+USUARIOS ENCONTRADOS
+===============================================================================
+{% for user in usuarios %}
+Usuario: {{ user.USERNAME }}
+  Estado: {{ user.ACCOUNT_STATUS }}
+  Auth: {{ user.AUTHENTICATION_TYPE | default('PASSWORD') }}
+  Creado: {{ user.CREATED }}
+  Profile: {{ user.PROFILE }}
+  Tablespace: {{ user.DEFAULT_TABLESPACE }}
+
+  Privilegios de Sistema:
+{% for priv in privilegios_sistema | selectattr('GRANTEE', 'equalto', user.USERNAME) %}
+    - {{ priv.PRIVILEGE }} (Admin: {{ priv.ADMIN_OPTION }})
+{% endfor %}
+
+  Roles Asignados:
+{% for role in roles | selectattr('GRANTEE', 'equalto', user.USERNAME) %}
+    - {{ role.GRANTED_ROLE }} (Admin: {{ role.ADMIN_OPTION }}, Default: {{ role.DEFAULT_ROLE }})
+{% endfor %}
+
+  Privilegios sobre Objetos:
+{% for obj in privilegios_objetos | selectattr('GRANTEE', 'equalto', user.USERNAME) %}
+    - {{ obj.PRIVILEGE }} en {{ obj.OWNER }}.{{ obj.TABLE_NAME }} (Grantable: {{ obj.GRANTABLE }})
+{% endfor %}
+
+-------------------------------------------------------------------------------
+{% endfor %}

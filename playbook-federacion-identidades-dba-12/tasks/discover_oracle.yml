@@ -1,0 +1,91 @@
+---
+# discover_oracle.yml - Descubrimiento por BD (compatible 12.1/12.2)
+# En 12.1 no existe la columna oracle_maintained en dba_users.
+# Se usa la lista oracle_excluded_users para filtrar cuentas de sistema.
+
+- name: Crear directorio de salida para {{ db.name }}
+  ansible.builtin.file:
+    path: "{{ output_base }}/{{ db.name }}"
+    state: directory
+    mode: "0755"
+
+- name: Definir conexion para {{ db.name }}
+  ansible.builtin.set_fact:
+    _conn:
+      host: "{{ db.host }}"
+      port: "{{ db.port }}"
+      service: "{{ db.service }}"
+      user: "{{ oracle_user }}"
+      password: "{{ oracle_password }}"
+      binds: {}
+
+- name: Consultar {{ db.name }}
+  block:
+    - name: Obtener usuarios
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ (_conn | combine({
+          "query": "SELECT username, account_status, created, profile, default_tablespace, authentication_type FROM dba_users WHERE username NOT IN (" + (oracle_excluded_users | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") AND username NOT LIKE '%$%' ORDER BY username"
+          })) | to_json }}'
+      register: usuarios_raw
+
+    - name: Obtener privilegios de sistema
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ (_conn | combine({
+          "query": "SELECT grantee, privilege, admin_option FROM dba_sys_privs WHERE grantee NOT IN (" + (oracle_excluded_users | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") AND grantee NOT LIKE '%$%' AND grantee IN (SELECT username FROM dba_users) ORDER BY grantee, privilege"
+          })) | to_json }}'
+      register: privilegios_sistema_raw
+
+    - name: Obtener privilegios de objetos
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ (_conn | combine({
+          "query": "SELECT grantee, owner, table_name, privilege, grantable FROM dba_tab_privs WHERE grantee NOT IN (" + (oracle_excluded_users | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") AND grantee NOT LIKE '%$%' AND grantee IN (SELECT username FROM dba_users) ORDER BY grantee, owner, table_name"
+          })) | to_json }}'
+      register: privilegios_objetos_raw
+
+    - name: Obtener roles asignados
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ (_conn | combine({
+          "query": "SELECT grantee, granted_role, admin_option, default_role FROM dba_role_privs WHERE grantee NOT IN (" + (oracle_excluded_users | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") AND grantee NOT LIKE '%$%' AND grantee IN (SELECT username FROM dba_users) ORDER BY grantee, granted_role"
+          })) | to_json }}'
+      register: roles_raw
+
+    - name: Parsear resultados
+      ansible.builtin.set_fact:
+        usuarios: "{{ usuarios_raw.stdout | from_json }}"
+        privilegios_sistema: "{{ privilegios_sistema_raw.stdout | from_json }}"
+        privilegios_objetos: "{{ privilegios_objetos_raw.stdout | from_json }}"
+        roles: "{{ roles_raw.stdout | from_json }}"
+
+  rescue:
+    - name: Error en consulta a {{ db.name }}
+      ansible.builtin.fail:
+        msg: "Error al consultar {{ db.name }}: {{ ansible_failed_result.msg | default('error desconocido') }}"
+
+- name: Guardar resultados de {{ db.name }}
+  ansible.builtin.copy:
+    content: "{{ item.data | to_nice_json }}"
+    dest: "{{ output_base }}/{{ db.name }}/{{ item.file }}"
+    mode: "0644"
+  loop:
+    - { file: "usuarios.json", data: "{{ usuarios }}" }
+    - { file: "privilegios_sistema.json", data: "{{ privilegios_sistema }}" }
+    - { file: "privilegios_objetos.json", data: "{{ privilegios_objetos }}" }
+    - { file: "roles.json", data: "{{ roles }}" }
+  loop_control:
+    label: "{{ item.file }}"
+
+- name: Generar reporte consolidado de {{ db.name }}
+  ansible.builtin.template:
+    src: templates/oracle_report.j2
+    dest: "{{ output_base }}/{{ db.name }}/reporte_completo.txt"
+    mode: "0644"
+  vars:
+    oracle_dsn: "{{ db.host }}:{{ db.port }}/{{ db.service }}"
+
+- name: Resumen de {{ db.name }}
+  ansible.builtin.debug:
+    msg: "{{ db.name }} ({{ db.version }}): {{ usuarios | length }} usuarios encontrados"

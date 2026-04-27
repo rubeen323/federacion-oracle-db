@@ -1,0 +1,274 @@
+---
+# =============================================================================
+# 10-migrate_users_to_kerberos.yml
+# Migra usuarios Oracle 12c a autenticacion Kerberos externa.
+#
+# DIFERENCIA CLAVE con 19c:
+#   19c (CMU):  ALTER USER <user> IDENTIFIED GLOBALLY AS '<DN_en_AD>'
+#   12c (Kerb): ALTER USER <user> IDENTIFIED EXTERNALLY AS '<sAMAccountName@REALM>'
+#
+# En 12c no hay CMU. Oracle solo valida el ticket Kerberos; no consulta AD.
+# El principal Kerberos es el UPN del usuario en AD (sAMAccountName@REALM).
+#
+# Los privilegios, roles, quotas y tablespaces NO se modifican.
+#
+# Referencia:
+#   https://docs.oracle.com/database/121/DBSEG/asokerb.htm (Step 8/9)
+#   https://docs.oracle.com/cd/E11882_01/network.112/e40393/asokerb.htm
+#
+# Uso:
+#   ansible-playbook 10-migrate_users_to_kerberos.yml --ask-vault-pass
+# =============================================================================
+
+- name: Migrar usuarios Oracle 12c a Kerberos (IDENTIFIED EXTERNALLY)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    reports_dir: "./Reportes"
+    output_base: "{{ reports_dir }}/migration_{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+
+  tasks:
+    # =========================================================
+    # 1. Validaciones
+    # =========================================================
+    - name: Validar configuracion
+      ansible.builtin.assert:
+        that:
+          - oracle_databases is defined and oracle_databases | length > 0
+          - kerberos_realm is defined
+          - ad_server_uri is defined
+          - ad_bind_dn is defined
+          - ad_bind_pw is defined
+
+    # =========================================================
+    # 2. Cargar descubrimiento
+    # =========================================================
+    - name: Buscar reportes de descubrimiento
+      ansible.builtin.find:
+        paths: "{{ reports_dir }}"
+        patterns: "oracle_discovery_*"
+        file_type: directory
+      register: discovery_dirs
+
+    - name: Validar descubrimiento
+      ansible.builtin.assert:
+        that: discovery_dirs.files | length > 0
+        fail_msg: "Ejecuta primero 1-oracle_users_discovery.yml"
+
+    - name: Determinar descubrimiento mas reciente
+      ansible.builtin.set_fact:
+        latest_discovery: "{{ (discovery_dirs.files | sort(attribute='mtime', reverse=true) | first).path }}"
+
+    - name: Cargar datos Oracle
+      ansible.builtin.include_tasks: tasks/load_discovery.yml
+      loop: "{{ oracle_databases }}"
+      loop_control:
+        loop_var: db
+        label: "{{ db.name }}"
+
+    # =========================================================
+    # 3. Validar backup de hashes
+    # =========================================================
+    - name: Buscar backups de hashes
+      ansible.builtin.find:
+        paths: "{{ reports_dir }}"
+        patterns: "password_backup_*"
+        file_type: directory
+      register: backup_dirs
+
+    - name: Validar backup
+      ansible.builtin.assert:
+        that: backup_dirs.files | length > 0
+        fail_msg: "Ejecuta primero 9-backup_password_hashes.yml"
+
+    # =========================================================
+    # 4. Consultar AD para obtener sAMAccountName
+    # =========================================================
+    - name: Consultar usuarios en AD
+      community.general.ldap_search:
+        server_uri: "{{ ad_server_uri }}"
+        bind_dn: "{{ ad_bind_dn }}"
+        bind_pw: "{{ ad_bind_pw }}"
+        dn: "{{ ad_search_base }}"
+        scope: "onelevel"
+        filter: "(&(objectClass=user)(objectCategory=person))"
+        attrs:
+          - sAMAccountName
+          - userPrincipalName
+        validate_certs: "{{ ad_validate_certs | default(false) }}"
+      register: ad_search_result
+
+    - name: Construir mapa sAMAccountName -> UPN (principal Kerberos)
+      ansible.builtin.set_fact:
+        ad_user_map: >-
+          {{ ad_user_map | default({}) | combine({
+            (item.sAMAccountName | first | upper): {
+              'sam': (item.sAMAccountName | first),
+              'upn': (item.userPrincipalName | first | default(item.sAMAccountName | first + '@' + kerberos_realm))
+            }
+          }) }}
+      loop: "{{ ad_search_result.results }}"
+      loop_control:
+        label: "{{ item.sAMAccountName | first }}"
+
+    # =========================================================
+    # 5. Clasificar candidatos
+    # =========================================================
+    - name: Determinar usuarios a migrar
+      ansible.builtin.set_fact:
+        users_to_migrate: "{{ oracle_users_list | intersect(ad_user_map.keys() | list) | difference(oracle_no_migrate) }}"
+
+    - name: Validar candidatos
+      ansible.builtin.assert:
+        that: users_to_migrate | length > 0
+        fail_msg: "No hay usuarios candidatos a migrar"
+
+    # =========================================================
+    # 6. Consultar estado actual
+    # =========================================================
+    - name: Consultar autenticacion actual
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "SELECT username, authentication_type FROM dba_users WHERE username IN (" + (users_to_migrate | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") ORDER BY username",
+            "binds": {}
+          }) | to_json }}'
+      register: auth_status_raw
+
+    - name: Filtrar pendientes
+      ansible.builtin.set_fact:
+        auth_status: "{{ auth_status_raw.stdout | from_json }}"
+        users_already_migrated: "{{ (auth_status_raw.stdout | from_json) | selectattr('AUTHENTICATION_TYPE', 'equalto', 'EXTERNAL') | map(attribute='USERNAME') | list }}"
+        users_pending: "{{ (auth_status_raw.stdout | from_json) | selectattr('AUTHENTICATION_TYPE', 'equalto', 'PASSWORD') | map(attribute='USERNAME') | list }}"
+
+    - name: Mostrar estado
+      ansible.builtin.debug:
+        msg:
+          - "Ya migrados (EXTERNAL): {{ users_already_migrated }}"
+          - "Pendientes (PASSWORD): {{ users_pending }}"
+
+    - name: Salir si no hay pendientes
+      ansible.builtin.meta: end_play
+      when: users_pending | length == 0
+
+    # =========================================================
+    # 7. Ejecutar migracion: ALTER USER IDENTIFIED EXTERNALLY AS
+    # =========================================================
+    - name: Construir principal Kerberos por usuario
+      ansible.builtin.set_fact:
+        user_principals: >-
+          {{ user_principals | default({}) | combine({
+            item: (ad_user_map[item].sam + '@' + kerberos_realm)
+          }) }}
+      loop: "{{ users_pending }}"
+
+    - name: Mostrar plan de migracion
+      ansible.builtin.debug:
+        msg: "{% for u in users_pending %}  {{ u }} -> IDENTIFIED EXTERNALLY AS '{{ user_principals[u] }}'\n{% endfor %}"
+
+    - name: Migrar usuario a IDENTIFIED EXTERNALLY
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "ALTER USER " + item + " IDENTIFIED EXTERNALLY AS '" + user_principals[item] + "'",
+            "binds": {}
+          }) | to_json }}'
+      loop: "{{ users_pending }}"
+      register: migration_results
+
+    # =========================================================
+    # 8. Verificar
+    # =========================================================
+    - name: Consultar estado post-migracion
+      ansible.builtin.script:
+        cmd: >
+          scripts/oracle_query.py '{{ ({
+            "host": oracle_databases[0].host,
+            "port": oracle_databases[0].port,
+            "service": oracle_databases[0].service,
+            "user": oracle_user,
+            "password": oracle_password,
+            "query": "SELECT username, authentication_type, external_name FROM dba_users WHERE username IN (" + (users_pending | map("regex_replace", "^(.*)$", "'\\1'") | join(",")) + ") ORDER BY username",
+            "binds": {}
+          }) | to_json }}'
+      register: post_migration_raw
+
+    - name: Parsear resultado
+      ansible.builtin.set_fact:
+        post_migration: "{{ post_migration_raw.stdout | from_json }}"
+
+    - name: Validar migracion
+      ansible.builtin.assert:
+        that:
+          - (post_migration | selectattr('USERNAME', 'equalto', item) | map(attribute='AUTHENTICATION_TYPE') | first) == 'EXTERNAL'
+        fail_msg: "FALLO: {{ item }} no migro a EXTERNAL"
+        success_msg: "OK: {{ item }} -> EXTERNAL ({{ user_principals[item] }})"
+      loop: "{{ users_pending }}"
+
+    # =========================================================
+    # 9. Reporte
+    # =========================================================
+    - name: Crear directorio de salida
+      ansible.builtin.file:
+        path: "{{ output_base }}"
+        state: directory
+        mode: "0755"
+
+    - name: Guardar reporte JSON
+      ansible.builtin.copy:
+        content: "{{ report_data | to_nice_json }}"
+        dest: "{{ output_base }}/migration_report.json"
+        mode: "0644"
+      vars:
+        report_data:
+          fecha: "{{ ansible_date_time.iso8601 }}"
+          metodo: "KERBEROS_EXTERNAL"
+          realm: "{{ kerberos_realm }}"
+          usuarios_migrados: "{{ users_pending | map('community.general.dict_kv', 'username') | list }}"
+          usuarios_ya_migrados: "{{ users_already_migrated }}"
+          usuarios_no_migrar: "{{ oracle_no_migrate }}"
+
+    - name: Generar reporte de texto
+      ansible.builtin.copy:
+        dest: "{{ output_base }}/migration_report.txt"
+        mode: "0644"
+        content: |
+          ============================================================
+          MIGRACION ORACLE 12c A KERBEROS (IDENTIFIED EXTERNALLY)
+          Fecha: {{ ansible_date_time.iso8601 }}
+          Realm: {{ kerberos_realm }}
+          ============================================================
+
+          USUARIOS MIGRADOS
+          ------------------------------------------------------------
+          {% for user in users_pending %}
+          {{ user }} -> IDENTIFIED EXTERNALLY AS '{{ user_principals[user] }}'
+          {% endfor %}
+
+          YA MIGRADOS PREVIAMENTE: {{ users_already_migrated | join(', ') | default('ninguno') }}
+          NO MIGRAR: {{ oracle_no_migrate | join(', ') }}
+
+          NOTAS:
+          - Privilegios, roles y quotas NO fueron modificados.
+          - FALLBACK_AUTHENTICATION=TRUE permite coexistencia.
+          - Validar: kinit {{ (users_pending | first | default('USER')) | lower }}@{{ kerberos_realm }} && sqlplus /@<service>
+          - Revertir: sqlplus / as sysdba @<backup>/restore_passwords.sql
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "=== MIGRACION COMPLETADA ==="
+          - "Usuarios migrados: {{ users_pending | length }}"
+          - "Metodo: IDENTIFIED EXTERNALLY AS '<sAMAccountName@REALM>'"
+          - "Reporte: {{ output_base }}"

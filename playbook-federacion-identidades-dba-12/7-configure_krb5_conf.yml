@@ -1,0 +1,88 @@
+---
+# =============================================================================
+# 7-configure_krb5_conf.yml
+# Configura /etc/krb5.conf en servidores Oracle 12c.
+# Identico al proyecto 19c.
+#
+# Referencia:
+#   https://docs.oracle.com/database/121/DBSEG/asokerb.htm
+#   https://web.mit.edu/kerberos/krb5-1.12/doc/admin/conf_files/krb5_conf.html
+#
+# Uso:
+#   ansible-playbook 7-configure_krb5_conf.yml
+# =============================================================================
+
+- name: Configurar krb5.conf para Oracle 12c + AD
+  hosts: oracle_servers
+  become: true
+  vars:
+    krb5_conf_path: "/etc/krb5.conf"
+    kerberos_domain: "{{ kerberos_realm | lower }}"
+    kdc_host: "{{ ad_server_uri | regex_replace('^ldaps?://', '') | regex_replace(':\\d+$', '') }}"
+
+  tasks:
+    - name: Determinar ORACLE_HOME
+      ansible.builtin.set_fact:
+        oracle_home: "{{ (oracle_databases | selectattr('host', 'equalto', inventory_hostname) | first).oracle_home }}"
+
+    - name: Verificar si krb5.conf existe
+      ansible.builtin.stat:
+        path: "{{ krb5_conf_path }}"
+      register: krb5_file
+
+    - name: Validar consistencia con sqlnet.ora
+      ansible.builtin.shell:
+        cmd: grep -i 'SQLNET.KERBEROS5_CONF=' {{ oracle_home }}/network/admin/sqlnet.ora | grep -v CONF_MIT | head -1 | cut -d'=' -f2
+      register: sqlnet_krb5_conf
+      changed_when: false
+      failed_when: false
+      become_user: oracle
+
+    - name: Respaldar krb5.conf existente
+      ansible.builtin.copy:
+        src: "{{ krb5_conf_path }}"
+        dest: "{{ krb5_conf_path }}.bak.{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        mode: "0644"
+      when: krb5_file.stat.exists
+
+    - name: Configurar krb5.conf
+      ansible.builtin.copy:
+        dest: "{{ krb5_conf_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # krb5.conf - Oracle 12c + Active Directory
+          # Generado por: 7-configure_krb5_conf.yml
+          # Fecha: {{ ansible_date_time.iso8601 }}
+
+          [libdefaults]
+            default_realm = {{ kerberos_realm }}
+            dns_lookup_realm = false
+            dns_lookup_kdc = false
+            ticket_lifetime = 24h
+            renew_lifetime = 7d
+            forwardable = true
+            default_tgs_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96
+            default_tkt_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96
+            permitted_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96
+
+          [realms]
+            {{ kerberos_realm }} = {
+              kdc = {{ kdc_host }}
+              admin_server = {{ kdc_host }}
+              default_domain = {{ kerberos_domain }}
+            }
+
+          [domain_realm]
+            .{{ kerberos_domain }} = {{ kerberos_realm }}
+            {{ kerberos_domain }} = {{ kerberos_realm }}
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "=== KRB5.CONF CONFIGURADO ==="
+          - "Realm: {{ kerberos_realm }}"
+          - "KDC: {{ kdc_host }}"
+          - "Cifrado: AES256 + AES128"

@@ -1,0 +1,43 @@
+---
+# Usuarios de sistema excluidos del descubrimiento
+oracle_excluded_users:
+  - SYS
+  - SYSTEM
+  - OUTLN
+  - DBSNMP
+
+# Bases de datos Oracle 12.1/12.2 a consultar
+# NOTA: oracle_maintained no existe en 12.1. El playbook usa la lista
+#       oracle_excluded_users para filtrar cuentas de sistema.
+oracle_databases:
+  - name: "DB12A"
+    host: "<ip>"
+    port: 1521
+    service: "<service_name>"
+    oracle_home: "/u01/app/oracle/product/12.1.0/dbhome_1"
+    version: "12.1"
+  # - name: "DB12B"
+  #   host: "<ip>"
+  #   port: 1521
+  #   service: "<service_name>"
+  #   oracle_home: "/u01/app/oracle/product/12.2.0/dbhome_1"
+  #   version: "12.2"
+
+# --- Configuracion Active Directory (LDAPS) ---
+ad_server_uri: "ldaps://dc01.laboratorio.local:636"
+ad_search_base: "OU=Oracle_DB_Users,DC=laboratorio,DC=local"
+ad_bind_dn: "CN=<bind_user>,CN=Users,DC=laboratorio,DC=local"
+
+# --- Configuracion Kerberos ---
+kerberos_realm: "LABORATORIO.LOCAL"
+kerberos_service: "oracle"
+kerberos_service_account: "<sAMAccountName_cuenta_servicio_kerberos>"
+
+# Usuarios Oracle que NO deben migrarse a AD (cuentas de servicio y schemas)
+oracle_no_migrate:
+  - APP_VENTAS
+  - APP_INVENTARIO
+  - APP_REPORTES
+  - SVC_WEBAPP
+  - SVC_MONITOR
+  - SVC_EXPDP

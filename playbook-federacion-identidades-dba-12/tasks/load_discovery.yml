@@ -1,0 +1,10 @@
+---
+- name: Cargar usuarios de {{ db.name }}
+  ansible.builtin.slurp:
+    src: "{{ latest_discovery }}/{{ db.name }}/usuarios.json"
+  register: _usuarios_file
+
+- name: Parsear usuarios de {{ db.name }}
+  ansible.builtin.set_fact:
+    oracle_users_list: "{{ (_usuarios_file.content | b64decode | from_json) | map(attribute='USERNAME') | list }}"
+    oracle_users_detail: "{{ _usuarios_file.content | b64decode | from_json }}"

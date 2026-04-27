@@ -1,0 +1,290 @@
+---
+# =============================================================================
+# 4-register_spn_keytab.yml
+# Registra los SPN en Active Directory y genera los keytab para cada servidor
+# Oracle, usando el reporte generado por 3-spn_report.yml.
+#
+# Prerequisitos:
+#   - Ejecutar primero 3-spn_report.yml (genera el reporte JSON con los SPN)
+#   - Configurar en vault.yml:
+#       dc_admin_user, dc_admin_password, kerberos_svc_password
+#   - Configurar en vars.yml:
+#       kerberos_service_account (sAMAccountName de la cuenta de servicio)
+#   - WinRM habilitado en el Domain Controller
+#   - TODO: Solicitar al equipo de AD la creacion de la cuenta de servicio
+#           Kerberos antes de ejecutar este playbook.
+#
+# Uso:
+#   ansible-playbook 4-register_spn_keytab.yml --ask-vault-pass
+#
+# Referencia:
+#   https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/ktpass
+#   https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/setspn
+#   https://docs.oracle.com/database/121/DBSEG/asokerb.htm
+# =============================================================================
+
+# =========================================================
+# Play 1: Cargar el ultimo reporte SPN generado
+# =========================================================
+- name: Cargar reporte SPN
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Buscar reportes SPN existentes
+      ansible.builtin.find:
+        paths: "./Reportes"
+        patterns: "spn_report_*"
+        file_type: directory
+      register: spn_dirs
+
+    - name: Validar que exista al menos un reporte SPN
+      ansible.builtin.assert:
+        that: spn_dirs.files | length > 0
+        fail_msg: "No se encontraron reportes SPN en ./Reportes/. Ejecuta primero 3-spn_report.yml"
+
+    - name: Determinar reporte mas reciente
+      ansible.builtin.set_fact:
+        latest_spn_dir: "{{ (spn_dirs.files | sort(attribute='mtime', reverse=true) | first).path }}"
+
+    - name: Leer reporte JSON
+      ansible.builtin.slurp:
+        src: "{{ latest_spn_dir }}/spn_report.json"
+      register: spn_json_raw
+
+    - name: Parsear reporte SPN
+      ansible.builtin.set_fact:
+        spn_report: "{{ spn_json_raw.content | b64decode | from_json }}"
+
+    - name: Mostrar SPNs a registrar
+      ansible.builtin.debug:
+        msg:
+          - "Reporte: {{ latest_spn_dir }}"
+          - "Servidores: {{ spn_report.servidores | length }}"
+          - "SPNs: {{ spn_report.spn_list }}"
+
+    - name: Validar cuenta de servicio Kerberos
+      ansible.builtin.assert:
+        that:
+          - kerberos_service_account is defined
+          - kerberos_service_account != '<sAMAccountName_cuenta_servicio_kerberos>'
+        fail_msg: >
+          La variable kerberos_service_account no esta configurada.
+          Solicita al equipo de AD la creacion de la cuenta de servicio
+          Kerberos y configura el sAMAccountName en vars.yml
+
+# =========================================================
+# Play 2: Registrar SPN y generar keytab en el DC
+# =========================================================
+- name: Registrar SPN y generar keytab en el Domain Controller
+  hosts: domain_controllers
+  gather_facts: false
+  vars:
+    ansible_user: "{{ dc_admin_user }}"
+    ansible_password: "{{ dc_admin_password }}"
+    spn_report: "{{ hostvars['localhost']['spn_report'] }}"
+    keytab_output_dir: "C:\\temp\\oracle_keytabs"
+
+  tasks:
+    - name: Crear directorio de salida para keytabs
+      ansible.windows.win_file:
+        path: "{{ keytab_output_dir }}"
+        state: directory
+
+    - name: Registrar SPN y generar keytab por servidor
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = "Stop"
+        $spn = "{{ item.spn }}"
+        $svcAccount = "{{ kerberos_service_account }}"
+        $svcPassword = "{{ kerberos_svc_password }}"
+        $hostname = "{{ item.hostname }}"
+        $keytabPath = "{{ keytab_output_dir }}\$hostname.keytab"
+
+        # --- Verificar si el SPN ya esta registrado ---
+        $existing = setspn -Q $spn 2>&1
+        if ($existing -match "No such SPN found") {
+            Write-Host "Registrando SPN: $spn"
+        } else {
+            Write-Host "SPN ya registrado: $spn - se regenerara el keytab"
+        }
+
+        # --- Generar keytab con ktpass (registra el SPN automaticamente) ---
+        # ktpass asocia el SPN a la cuenta de servicio y genera el keytab.
+        # /crypto AES256-SHA1: cifrado recomendado (no usar DES/RC4)
+        # /ptype KRB5_NT_PRINCIPAL: tipo de principal recomendado por Microsoft
+        # /mapop set: sobreescribe el mapeo si ya existe
+        # +dumpsalt: muestra el salt usado (util para debug)
+        ktpass /out $keytabPath `
+               /princ $spn `
+               /mapuser "$svcAccount" `
+               /pass $svcPassword `
+               /crypto AES256-SHA1 `
+               /ptype KRB5_NT_PRINCIPAL `
+               /mapop set `
+               +dumpsalt `
+               /answer + 2>&1
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "ktpass fallo para SPN: $spn"
+        }
+
+        # --- Verificar que el keytab se genero ---
+        if (-not (Test-Path $keytabPath)) {
+            throw "No se genero el keytab en: $keytabPath"
+        }
+
+        Write-Host "Keytab generado: $keytabPath"
+
+        # --- Verificar SPN registrado ---
+        setspn -L $svcAccount
+      loop: "{{ spn_report.servidores }}"
+      loop_control:
+        label: "{{ item.spn }}"
+      register: ktpass_results
+      no_log: true
+
+    - name: Mostrar resultado por servidor
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines | default([]) }}"
+      loop: "{{ ktpass_results.results }}"
+      loop_control:
+        label: "{{ item.item.hostname }}"
+
+# =========================================================
+# Play 3: Copiar keytabs a los servidores Oracle
+# =========================================================
+- name: Distribuir keytabs a servidores Oracle
+  hosts: domain_controllers
+  gather_facts: false
+  vars:
+    ansible_user: "{{ dc_admin_user }}"
+    ansible_password: "{{ dc_admin_password }}"
+    spn_report: "{{ hostvars['localhost']['spn_report'] }}"
+    keytab_output_dir: "C:\\temp\\oracle_keytabs"
+
+  tasks:
+    - name: Leer keytab de cada servidor
+      ansible.builtin.slurp:
+        path: "{{ keytab_output_dir }}\\{{ item.hostname }}.keytab"
+      loop: "{{ spn_report.servidores }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+      register: keytab_files
+
+    - name: Guardar keytabs como facts para el siguiente play
+      ansible.builtin.set_fact:
+        keytab_data: "{{ keytab_data | default({}) | combine({item.item.hostname: item.content}) }}"
+      loop: "{{ keytab_files.results }}"
+      loop_control:
+        label: "{{ item.item.hostname }}"
+
+- name: Instalar keytabs en servidores Oracle
+  hosts: oracle_servers
+  become: true
+  vars:
+    spn_report: "{{ hostvars['localhost']['spn_report'] }}"
+    keytab_data: "{{ hostvars[groups['domain_controllers'][0]]['keytab_data'] }}"
+    keytab_dest: "/etc/oracle/keytab"
+
+  tasks:
+    - name: Crear directorio para keytab
+      ansible.builtin.file:
+        path: "{{ keytab_dest }}"
+        state: directory
+        owner: oracle
+        group: oinstall
+        mode: "0700"
+
+    - name: Copiar keytab al servidor
+      ansible.builtin.copy:
+        content: "{{ keytab_data[ansible_hostname] | b64decode }}"
+        dest: "{{ keytab_dest }}/v5srvtab"
+        owner: oracle
+        group: oinstall
+        mode: "0600"
+      when: ansible_hostname in keytab_data
+
+    - name: Verificar keytab con klist
+      ansible.builtin.command:
+        cmd: klist -k -t {{ keytab_dest }}/v5srvtab
+      register: klist_output
+      changed_when: false
+
+    - name: Mostrar contenido del keytab
+      ansible.builtin.debug:
+        msg: "{{ klist_output.stdout_lines }}"
+
+# =========================================================
+# Play 4: Generar reporte de registro
+# =========================================================
+- name: Generar reporte de registro SPN y keytab
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    reports_dir: "./Reportes"
+    output_base: "{{ reports_dir }}/spn_register_{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+    spn_report: "{{ hostvars['localhost']['spn_report'] }}"
+
+  tasks:
+    - name: Crear directorio de salida
+      ansible.builtin.file:
+        path: "{{ output_base }}"
+        state: directory
+        mode: "0755"
+
+    - name: Guardar reporte JSON
+      ansible.builtin.copy:
+        dest: "{{ output_base }}/spn_register_report.json"
+        mode: "0644"
+        content: "{{ report_data | to_nice_json }}"
+      vars:
+        report_data:
+          fecha: "{{ ansible_date_time.iso8601 }}"
+          realm: "{{ spn_report.realm }}"
+          servicio: "{{ spn_report.servicio }}"
+          cuenta_servicio: "{{ kerberos_service_account }}"
+          servidores: "{{ spn_report.servidores }}"
+          spn_registrados: "{{ spn_report.spn_list }}"
+          keytab_destino: "/etc/oracle/keytab/v5srvtab"
+
+    - name: Generar reporte de texto
+      ansible.builtin.copy:
+        dest: "{{ output_base }}/spn_register_report.txt"
+        mode: "0644"
+        content: |
+          ============================================================
+          REPORTE DE REGISTRO SPN Y GENERACION DE KEYTAB
+          Fecha: {{ ansible_date_time.iso8601 }}
+          Realm: {{ spn_report.realm }}
+          Cuenta de servicio: {{ kerberos_service_account }}
+          ============================================================
+
+          SPN REGISTRADOS EN ACTIVE DIRECTORY
+          ------------------------------------------------------------
+          {% for srv in spn_report.servidores %}
+          Servidor : {{ srv.host }}
+          FQDN     : {{ srv.fqdn }}
+          SPN      : {{ srv.spn }}
+          Keytab   : /etc/oracle/keytab/v5srvtab
+          ------------------------------------------------------------
+          {% endfor %}
+
+          Total: {{ spn_report.servidores | length }} SPN registrados
+
+          NOTAS:
+          - Los keytabs fueron generados con cifrado AES256-SHA1
+          - Ubicacion en servidores Oracle: /etc/oracle/keytab/v5srvtab
+          - Permisos: oracle:oinstall 0600
+          - Referenciar en sqlnet.ora con:
+            SQLNET.KERBEROS5_KEYTAB=/etc/oracle/keytab/v5srvtab
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "=== REGISTRO SPN Y KEYTAB COMPLETADO ==="
+          - "Reporte: {{ output_base }}"
+          - "SPNs registrados: {{ spn_report.spn_list }}"
+          - "Cuenta de servicio: {{ kerberos_service_account }}"
+          - "Keytab destino: /etc/oracle/keytab/v5srvtab"
